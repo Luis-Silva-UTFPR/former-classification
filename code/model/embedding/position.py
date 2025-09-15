@@ -37,9 +37,20 @@ class PositionalEncoding(nn.Module):
 
         self.register_buffer('pe', pe)
 
+    # def forward(self, time):
+    #     output = torch.stack(
+    #         [torch.index_select(
+    #             self.pe, 0, time[i, :]
+    #         ) for i in range(time.shape[0])], dim=0)
+    #     return output       # [batch_size, seq_length, embed_dim]
+
     def forward(self, time):
+        # força os índices para long
+        time = time.long()
+        
         output = torch.stack(
             [torch.index_select(
                 self.pe, 0, time[i, :]
             ) for i in range(time.shape[0])], dim=0)
-        return output       # [batch_size, seq_length, embed_dim]
+        return output  # [batch_size, seq_length, embed_dim]
+

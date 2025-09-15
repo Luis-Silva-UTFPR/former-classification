@@ -2,19 +2,39 @@ import os
 import torch
 import torch.nn as nn
 import numpy as np
-from torch.optim import Adam
 from torch.utils.data import DataLoader
-from model import BERT, BERTClassification
-from .focal_loss import FocalLoss
-
-# from .metric import Average_Accuracy, Kappa_Coefficient
-from sklearn.metrics import (
-    confusion_matrix,
-    cohen_kappa_score,
-    classification_report,
-    f1_score,
-)
+from model import BERT, BERTRegression
 from tqdm.auto import tqdm
+from torch_optimizer import AdaBelief
+
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import matplotlib.pyplot as plt
+
+
+class QuantileLoss(nn.Module):
+    def __init__(self, quantile):
+        super().__init__()
+        self.quantile = quantile
+
+    def forward(self, y_pred, y_true):
+        errors = y_true - y_pred
+        loss = torch.max((self.quantile - 1) * errors, self.quantile * errors)
+        return torch.mean(loss)
+
+
+class RMSELoss(nn.Module):
+    def __init__(self):
+        super(RMSELoss, self).__init__()
+        self.mse = nn.MSELoss()
+
+    def forward(self, y_pred, y_true):
+        loss = torch.sqrt(self.mse(y_pred, y_true))
+        return loss
+    
+
+class MAPELoss(nn.Module):
+    def forward(self, y_pred, y_true):
+        return torch.mean(torch.abs((y_true - y_pred) / (y_true + 1e-8)))
 
 
 class BERTFineTuner:
@@ -24,8 +44,8 @@ class BERTFineTuner:
         num_classes: int,
         train_loader: DataLoader,
         valid_loader: DataLoader,
-        criterion="CrossEntropyLoss",
-        lr: float = 1e-3,
+        criterion="MSELoss",
+        lr: float = 5e-5,
         weight_decay=0,
         with_cuda: bool = True,
         cuda_devices=None,
@@ -42,20 +62,60 @@ class BERTFineTuner:
         )
 
         print(f"Running on {self.device}...")
-
         self.bert = bert
-        self.model = BERTClassification(bert, num_classes)
+        self.bert.to(self.device)
+        for param in self.bert.parameters():
+            param.requires_grad = True
+        for param in self.bert.embedding.parameters():
+            param.requires_grad = False
+
+        self.model = BERTRegression(bert).to(self.device)
+
+        params = list(self.model.parameters()) + list(self.bert.parameters())
         self.num_classes = num_classes
+
+        self.lr = lr
+        self.best_loss = float("inf")
+
+        if with_cuda and torch.cuda.is_available():
+            if torch.cuda.device_count() > 1:
+                print(f"Using {torch.cuda.device_count()} GPUs for model pre-training")
+                self.model = nn.DataParallel(self.model, device_ids=cuda_devices)
+            torch.backends.cudnn.benchmark = True
 
         self.train_loader = train_loader
         self.valid_loader = valid_loader
 
-        self.optim = Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
+        self.weight_decay = weight_decay
+        betas = (0.9, 0.999)  # Usado em otimizadores que exigem beta1 e beta2
 
-        if criterion == "FocalLoss":
-            self.criterion = FocalLoss(gamma=1)
+
+        # self.optim = Adam(params, lr=lr, betas=betas, weight_decay=weight_decay)
+        self.optim = AdaBelief(params, lr=lr, betas=betas, weight_decay=weight_decay) # 0.14 0.10 0.07
+
+        self.train_maes = []
+        self.valid_maes = []
+        self.train_mses = []
+        self.valid_mses = []
+        self.train_r2s = []
+        self.valid_r2s = []
+
+
+        if criterion == "MSELoss": # 0.40 0.20 0.05
+            self.criterion = nn.MSELoss()
+        elif criterion == "MAELoss": # 0.38 0.14 0.12
+            self.criterion = nn.L1Loss()
+        elif criterion == "RMSELoss": # 0.40 0.19 0.0
+            self.criterion = RMSELoss()
+        elif criterion == "HuberLoss": # 0.39 0.14 0.08
+            self.criterion = nn.HuberLoss(delta=1.0)
+        elif criterion == "SmoothL1Loss": # 0.42 0.20 0.09
+            self.criterion = nn.SmoothL1Loss(beta=1.0)
+        elif criterion == "QuantileLoss": # 0.37 0.12 0.02
+            self.criterion = QuantileLoss(quantile=0.5)
         else:
-            self.criterion = nn.CrossEntropyLoss()
+            raise ValueError(f"Unsupported criterion: {criterion}")
+
 
         if with_cuda and torch.cuda.is_available():
             if torch.cuda.device_count() > 1:
@@ -75,24 +135,30 @@ class BERTFineTuner:
 
     def train(self, epoch):
         self.model.train()
-
         train_loss = 0.0
         counter = 0
+
+        all_preds = []
+        all_labels = []
+
         for data in self.train_loader:
             data = {key: value.to(self.device) for key, value in data.items()}
 
             predict = self.model(
                 data["bert_input"].float(),
                 data["timestamp"].long(),
-                data["bert_mask"].long(),
+                data["bert_mask"].long()
+                # data["area_ha"].squeeze().float(),
+                # data["ndvi"],
+                # data["ndwi"],
             )
-
-            loss = self.criterion(predict, data["class_label"].squeeze().long())
+            target = data["class_label"].squeeze(-1).float()
+            loss = self.criterion(predict, target)
 
             if torch.isnan(loss):  # PROBLEM!
-                print(data["class_label"].squeeze().long())
-                print(predict)
-                print(data["timestamp"].long())
+                print("Detected NaN in loss!")
+                print(f"Labels: {data['class_label'].squeeze().cpu()}")
+                print(f"Predictions: {predict.cpu()}")
                 exit(1)
 
             self.optim.zero_grad()
@@ -100,27 +166,47 @@ class BERTFineTuner:
             self.optim.step()
             train_loss += loss.item()
 
+            preds = predict.detach().cpu().numpy()
+            labels = data["class_label"].detach().cpu().numpy()
+
+            all_preds.append(preds)
+            all_labels.append(labels)
+
             counter += 1
+        
+        all_preds = np.concatenate(all_preds)
+        all_labels = np.concatenate(all_labels)
+
+        train_r2 = r2_score(all_labels, all_preds)
+        train_mae = mean_absolute_error(all_labels, all_preds)
+        train_mse = mean_squared_error(all_labels, all_preds)
+
+        self.train_r2s.append(train_r2)
+        self.train_maes.append(train_mae)
+        self.train_mses.append(train_mse)
 
         train_loss /= counter
+        valid_loss, metrics, y_p, y = self.validate()
 
-        valid_loss, valid_OA, valid_kappa, valid_F1score = self.validate()
+        self.valid_maes.append(metrics["MAE"])
+        self.valid_mses.append(metrics["MSE"])
+        self.valid_r2s.append(metrics["R2"])
+
+
         print(
-            "EP%d, Valid Accuracy: OA=%.2f%%, medium_F1_score=%.2f%%"
-            % (epoch, valid_OA, valid_F1score)
+            "EP%d, Train Loss: %.4f, Train R2: %.4f, Valid Loss: %.4f, Valid MAE: %.4f, Valid MSE: %.4f, Valid R2: %.4f"
+            % (epoch, train_loss, train_r2, valid_loss, metrics["MAE"], metrics["MSE"], metrics["R2"])
         )
-
-        return train_loss, valid_loss, valid_OA, valid_kappa, valid_F1score
+        return train_loss, valid_loss, metrics, y_p, y, train_r2, train_mae, train_mse
 
     def validate(self):
         self.model.eval()
 
         valid_loss = 0.0
         counter = 0
-        total_correct = 0
-        total_element = 0
         y_pred = []
         y_true = []
+
         for data in self.valid_loader:
             data = {key: value.to(self.device) for key, value in data.items()}
 
@@ -128,84 +214,67 @@ class BERTFineTuner:
                 y_p = self.model(
                     data["bert_input"].float(),
                     data["timestamp"].long(),
-                    data["bert_mask"].long(),
+                    data["bert_mask"].long()
                 )
 
-                y = data["class_label"].view(-1)
-                loss = self.criterion(y_p, y.long())
+                y = data["class_label"].view(-1).float()
+                loss = self.criterion(y_p, y)
 
             valid_loss += loss.item()
 
-            y_true.extend(list(map(int, y.cpu())))
-            y_p = y_p.argmax(dim=-1)
-            y_pred.extend(list(map(int, y_p.cpu())))
-
-            # compute OA
-            correct = (y == y_p).sum()
-            total_correct += correct
-            total_element += y.numel()
+            y_true.extend(y.cpu().tolist())
+            y_pred.extend(y_p.cpu().tolist())
 
             counter += 1
 
         valid_loss /= counter
-        valid_OA = total_correct * 100.0 / total_element
-        valid_kappa = cohen_kappa_score(
-            y_true, y_pred, labels=list(range(self.num_classes))
-        )
-        valid_F1score = (
-            f1_score(
-                y_true, y_pred, average="macro", labels=list(range(self.num_classes))
-            )
-            * 100.0
-        )
+        mae = mean_absolute_error(y_true, y_pred)
+        mse = mean_squared_error(y_true, y_pred)
+        r2 = r2_score(y_true, y_pred)
 
-        return valid_loss, valid_OA, valid_kappa, valid_F1score
+        composite_metric = mae - r2
+
+        return valid_loss, {"MAE": mae, "MSE": mse, "R2": r2, "COMPOSITE": composite_metric}, y_p, y
 
     def test(self, data_loader):
         self.model.eval()
 
-        total_correct = 0
-        total_element = 0
         y_pred = []
         y_true = []
-        for data in tqdm(data_loader, miniters=1, unit="test"):
+        area_ha = []
+
+        for data in tqdm(data_loader, desc="Testing..."):
             data = {key: value.to(self.device) for key, value in data.items()}
 
             with torch.no_grad():
                 y_p = self.model(
                     data["bert_input"].float(),
                     data["timestamp"].long(),
-                    data["bert_mask"].long(),
+                    data["bert_mask"].long()
+                    # data["area_ha"].squeeze().float(),
+                    # data["ndvi"],
+                    # data["ndwi"],
                 )
 
-                y = data["class_label"].view(-1)
+                y = data["class_label"].view(-1).float()
 
-            y_true.extend(list(map(int, y.cpu())))
-            y_p = y_p.argmax(dim=-1)
-            y_pred.extend(list(map(int, y_p.cpu())))
+            y_true.extend(y.cpu().tolist())
+            y_pred.extend(y_p.cpu().tolist())
+            area_ha.extend(data["area_ha"].cpu().tolist())
 
-            # compute OA
-            correct = (y == y_p).sum()
-            total_correct += correct
-            total_element += y.numel()
+        # y_true = np.array(y_true)
+        # y_pred = np.array(y_pred)
+        # area_ha = np.array(area_ha)
 
-        test_OA = total_correct * 100.0 / total_element
-        test_kappa = cohen_kappa_score(y_true, y_pred)
-        test_F1score = (
-            f1_score(
-                y_true, y_pred, average="macro", labels=list(range(self.num_classes))
-            )
-            * 100.0
-        )
-        test_conf = (
-            confusion_matrix(y_true, y_pred, labels=list(range(self.num_classes)))
-            * 100.0
-        )
-        test_report = classification_report(
-            y_true, y_pred, labels=list(range(self.num_classes))
-        )
+        mae = mean_absolute_error(y_true, y_pred)
+        mse = mean_squared_error(y_true, y_pred)
+        r2 = r2_score(y_true, y_pred)
 
-        return test_OA, test_kappa, test_F1score, test_conf, test_report
+        return {
+            "MAE": mae,
+            "MSE": mse,
+            "R2": r2
+        }, y_true, y_pred, area_ha
 
     def save(self, epoch, path):
         if not os.path.exists(path):
@@ -240,21 +309,173 @@ class BERTFineTuner:
             print("Error: parameter file does not exist!")
 
     def predict(self, data_loader):
+        # Coloca o modelo em modo de avaliação
         self.model.eval()
         y_preds = []
 
-        with torch.inference_mode():
-            for data in tqdm(data_loader, desc="Predicting..."):
-                data = {key: value.to(self.device) for key, value in data.items()}
+        self.model.to(self.device)
 
+
+        with torch.inference_mode():  # Certifique-se de usar o modo de inferência
+            for data in tqdm(data_loader, desc="Predicting..."):
+                # Move os dados para o mesmo dispositivo do modelo
+                data = {key: value.to(self.device) for key, value in data.items()}
+                
+                # Garantia de que o modelo também está no dispositivo correto
+                self.model.to(self.device)
+
+                # Passa os dados pelo modelo
                 result = self.model(
                     data["bert_input"].float(),
                     data["timestamp"].long(),
-                    data["bert_mask"].long(),
+                    data["bert_mask"].long()
+                    # data["area_ha"].squeeze().float(),
+                    # data["ndvi"],
+                    # data["ndwi"],
                 )
+                
+                # Move o resultado para CPU antes de adicionar à lista
+                y_preds.extend(result.cpu().tolist())
 
-                y_preds += result.argmax(dim=-1).numpy(force=True).tolist()
-
+        # Retorna o modelo ao modo de treinamento
         self.model.train()
+        return np.array(y_preds)
 
-        return np.array(y_preds, dtype=np.int16)
+    
+    def plot_metrics(self, output_dir="belief"):
+        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(os.path.join(output_dir, "mse_dp_03"), exist_ok=True)
+        abs_path = os.path.join(output_dir, "mse_dp_03")
+
+        # Plot MAE
+        plt.figure(figsize=(10, 6))
+        plt.plot(self.valid_maes[0:], label="MAE de Validação - Todas as Épocas")
+        plt.xlabel("Epochs")
+        plt.ylabel("Mean Absolute Error")
+        plt.title("MAE de Validação - Todas as Épocas")
+        plt.legend()
+        plt.grid()
+        plt.savefig(f"{abs_path}/valid_mae_all.png")
+        plt.close()
+
+        # Plot MAE
+        plt.figure(figsize=(10, 6))
+        plt.plot(self.valid_maes[50:], label="MAE de Validação - Pós 'estabilidade'")
+        plt.xlabel("Epochs")
+        plt.ylabel("Mean Absolute Error")
+        plt.title("MAE de Validação - Pós 'estabilidade'")
+        plt.legend()
+        plt.grid()
+        plt.savefig(f"{abs_path}/valid_mae_stable_all.png")
+        plt.close()
+
+        # Plot MSE
+        plt.figure(figsize=(10, 6))
+        plt.plot(self.valid_mses[0:], label="MSE de Validação - Todas as Épocas")
+        plt.xlabel("Epochs")
+        plt.ylabel("Mean Squared Error")
+        plt.title("MSE de Validação - Todas as Épocas")
+        plt.legend()
+        plt.grid()
+        plt.savefig(f"{abs_path}/valid_mse_all.png")
+        plt.close()
+
+        # Plot MSE
+        plt.figure(figsize=(10, 6))
+        plt.plot(self.valid_mses[50:], label="MSE de Validação - Pós 'estabilidade'")
+        plt.xlabel("Epochs")
+        plt.ylabel("Mean Squared Error")
+        plt.title("MSE de Validação - Pós 'estabilidade'")
+        plt.legend()
+        plt.grid()
+        plt.savefig(f"{abs_path}/valid_mse_stable_all.png")
+        plt.close()
+
+        # Plot R2
+        plt.figure(figsize=(10, 6))
+        plt.plot(self.valid_r2s[0:], label="R² de Validação - Todas as Épocas")
+        plt.xlabel("Epochs")
+        plt.ylabel("R²")
+        plt.title("R² de Validação - Todas as Épocas")
+        plt.legend()
+        plt.grid()
+        plt.savefig(f"{abs_path}/valid_r2_all.png")
+        plt.close()
+
+        # Plot R2
+        plt.figure(figsize=(10, 6))
+        plt.plot(self.valid_r2s[50:], label="R² de Validação - Pós 'estabilidade'")
+        plt.xlabel("Epochs")
+        plt.ylabel("R²")
+        plt.title("R² de Validação - Pós 'estabilidade'")
+        plt.legend()
+        plt.grid()
+        plt.savefig(f"{abs_path}/valid_r2_stable_all.png")
+        plt.close()
+
+        # Plot MAE
+        plt.figure(figsize=(10, 6))
+        plt.plot(self.train_maes[0:], label="MAE de Treinamento - Todas as Épocas")
+        plt.xlabel("Epochs")
+        plt.ylabel("Mean Absolute Error")
+        plt.title("MAE de Treinamento - Todas as Épocas")
+        plt.legend()
+        plt.grid()
+        plt.savefig(f"{abs_path}/train_mae_all.png")
+        plt.close()
+
+
+        # Plot MAE
+        plt.figure(figsize=(10, 6))
+        plt.plot(self.train_maes[50:], label="MAE de Treinamento - Pós 'estabilidade'")
+        plt.xlabel("Epochs")
+        plt.ylabel("Mean Absolute Error")
+        plt.title("MAE de Treinamento - Pós 'estabilidade'")
+        plt.legend()
+        plt.grid()
+        plt.savefig(f"{abs_path}/train_mae_stable_all.png")
+        plt.close()
+
+        # Plot MSE
+        plt.figure(figsize=(10, 6))
+        plt.plot(self.train_mses[0:], label="MSE de Treinamento - Todas as Épocas")
+        plt.xlabel("Epochs")
+        plt.ylabel("Mean Squared Error")
+        plt.title("MSE de Treinamento - Todas as Épocas")
+        plt.legend()
+        plt.grid()
+        plt.savefig(f"{abs_path}/train_mse_all.png")
+        plt.close()
+
+        # Plot MSE
+        plt.figure(figsize=(10, 6))
+        plt.plot(self.train_mses[50:], label="MSE de Treinamento - Pós 'estabilidade'")
+        plt.xlabel("Epochs")
+        plt.ylabel("Mean Squared Error")
+        plt.title("MSE de Treinamento - Pós 'estabilidade'")
+        plt.legend()
+        plt.grid()
+        plt.savefig(f"{abs_path}/train_mse_stable_all.png")
+        plt.close()
+
+        # Plot R2
+        plt.figure(figsize=(10, 6))
+        plt.plot(self.train_r2s[0:], label="R² de Treinamento - Todas as Épocas")
+        plt.xlabel("Epochs")
+        plt.ylabel("R²")
+        plt.title("R² de Treinamento - Todas as Épocas")
+        plt.legend()
+        plt.grid()
+        plt.savefig(f"{abs_path}/train_r2_all.png")
+        plt.close()
+
+        # Plot R2
+        plt.figure(figsize=(10, 6))
+        plt.plot(self.train_r2s[50:], label="R² de Treinamento - Pós 'estabilidade'")
+        plt.xlabel("Epochs")
+        plt.ylabel("R²")
+        plt.title("R² de Treinamento - Pós 'estabilidade'")
+        plt.legend()
+        plt.grid()
+        plt.savefig(f"{abs_path}/train_r2_stable_all.png")
+        plt.close()

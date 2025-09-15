@@ -8,7 +8,7 @@ import random
 import os
 import argparse
 import geopandas as gpd
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 
 def setup_seed(seed):
@@ -28,7 +28,7 @@ def Config():
     )
     parser.add_argument(
         "--pretrain_path",
-        default=None,
+        default="../checkpoints/pretrain",
         type=str,
         required=False,
         help="The storage path of the pre-trained model parameters.",
@@ -180,7 +180,7 @@ if __name__ == "__main__":
 
     trainer = BERTFineTuner(
         bert,
-        config.num_classes,
+        num_classes=15,
         train_loader=None,
         valid_loader=None,
         lr=config.learning_rate,
@@ -191,22 +191,25 @@ if __name__ == "__main__":
 
     print("Testing SITS-Former...")
     trainer.load(config.finetune_path)
+
+    # Prever os valores de saída usando o dataset de previsão
     y_pred = trainer.predict(pred_data_loader)
 
+    # Carregar os dados de entrada e adicionar as previsões
     df = gpd.read_parquet(pred_path)
     df["y_pred"] = y_pred
-    df["crop_number"] = pred_dataset.class_labels
+    df["y_true"] = df["prod"] / ((df["area_ha"]*10000)/2500)
 
-    print(
-        classification_report(
-            df["crop_number"], df["y_pred"], labels=list(range(config.num_classes))
-        )
-    )
+    y_true = df["y_true"]
+    mae = mean_absolute_error(y_true, y_pred)
+    mse = mean_squared_error(y_true, y_pred)
+    r2 = r2_score(y_true, y_pred)
 
-    print(
-        confusion_matrix(
-            df["crop_number"], df["y_pred"], labels=list(range(config.num_classes))
-        )
-    )
+    print(f"MAE: {mae:.4f}")
+    print(f"MSE: {mse:.4f}")
+    print(f"R²: {r2:.4f}")
 
-    df.to_parquet("../data/output.parquet")
+    # Salvar as previsões (opcional)
+    df.to_parquet("predictions.parquet")
+    df.to_file("predictions.gpkg", driver="GPKG")
+    print(f"Previsões salvas em: {pred_path.replace('.parquet', '_predictions.parquet')}")

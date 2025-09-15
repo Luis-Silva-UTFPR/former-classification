@@ -1,70 +1,191 @@
+from matplotlib import pyplot as plt
 from torch.utils.data import Dataset
 import torch
+import os
 import numpy as np
 import geopandas as gpd
 from dataset.data_augmentation import transform
 import concurrent.futures
 from tqdm.std import tqdm
 
+import numpy as np
+from scipy.signal import savgol_filter
+from scipy.ndimage import gaussian_filter1d
 
-def prepare_sample(sample_path, max_length, norm, augment):
-    with np.load(sample_path) as sample:
-        # class label of this time series
-        class_label = sample["class_label"]
 
-        # cloudfree image patch time series
-        ts_origin = sample["ts"]  # [seq_Length, band_nums, patch_size, patch_size]
-        if norm is not None:
-            m, s = norm
-            m = np.expand_dims(m, axis=-1)
-            s = np.expand_dims(s, axis=-1)
-            shape = ts_origin.shape
-            ts_origin = ts_origin.reshape((shape[0], shape[1], -1))
-            ts_origin = (ts_origin - m) / s
-            ts_origin = ts_origin.reshape(shape)
-        else:
-            ts_origin = ts_origin / 10000.0
 
-        ts_origin = ts_origin.astype(np.float32)
+def adjust_doy(doy):
+    """ Ajusta os valores de DOY para que setembro-dezembro apareça antes de janeiro-junho """
+    doy_adjusted = np.where(doy > 200, doy - 365, doy)  # Move DOYs de setembro-dezembro para antes de 0
+    sorted_indices = np.argsort(doy_adjusted)  # Reordena os valores corrigidos
+    return doy_adjusted[sorted_indices], sorted_indices
 
-        if augment:
-            ts_origin = transform(ts_origin)
 
-        # length of this time series (varies for each sample)
-        ts_length = ts_origin.shape[0]
+def prepare_sample(sample_path, max_length, norm, augment, prod, area_ha, id):
+    try:
+        with np.load(sample_path) as sample:
+            # class label of this time series
+            class_label = sample["class_label"]
+            
+            # cloudfree image patch time series
+            ts_origin = sample["ts"]  # [seq_Length, band_nums, patch_size, patch_size]
+            class_label = (prod / area_ha)
+            # class_label = np.log(class_label)  # Aplicar log para normalizar a produtividade
 
-        # padding time series to the same length
-        ts_origin = np.pad(
-            ts_origin,
-            ((0, max_length - ts_length), (0, 0), (0, 0), (0, 0)),
-            mode="constant",
-            constant_values=0.0,
-        )
+            B3 = ts_origin[:, 1, :, :]  # Banda do verde (Green)
+            B4 = ts_origin[:, 2, :, :]  # Banda do vermelho (Red)
+            B8 = ts_origin[:, 6, :, :]  # Banda do infravermelho próximo (NIR)
 
-        # acquisition dates of this time series
-        doy = sample["doy"]  # [seq_Length, ]
-        doy = np.pad(
-            doy,
-            (0, max_length - ts_length),
-            mode="constant",
-            constant_values=0,
-        )
+            # NDVI = (B8 - B4) / (B8 + B4)
+            ndvi = (B8 - B4) / (B8 + B4 + 1e-10)  # Adiciona 1e-10 para evitar divisão por zero
 
-        # mask of valid observations
-        bert_mask = np.zeros((max_length,), dtype=np.int16)
-        bert_mask[:ts_length] = 1
+            
+            ndvi_mean = np.mean(ndvi, axis=(1, 2))  # Média ao longo dos pixels (5x5)
 
-        return (
-            ts_origin,
-            bert_mask,
-            doy,
-            class_label,
-        )
+            # Suavizar NDVI com filtro Savitzky-Golay
+            if len(ndvi_mean) >= 5:  # Para Savitzky-Golay o comprimento mínimo é 5
+                ndvi_smooth = savgol_filter(ndvi_mean, window_length=5, polyorder=2)  # Janela de 5 pontos e polinômio de ordem 2
+            else:
+                ndvi_smooth = ndvi_mean
+
+            # Suavização com filtro gaussiano
+            ndvi_smooth = gaussian_filter1d(ndvi_smooth, sigma=2)
+            ndvi_smooth_list = ndvi_smooth.tolist()
+            
+
+            root_path = os.path.join(
+                "plots_ndvi", id
+            )
+
+            if not os.path.exists(root_path):
+                os.makedirs(root_path)
+
+            
+
+            # Encontrar o índice do pico (máximo valor de NDVI)
+            peak_idx = np.argmax(ndvi_smooth)
+            doy = sample["doy"]  # [seq_Length, ]
+
+            doy_adjusted, sorted_indices = adjust_doy(doy)
+
+            # Reordenar os valores de NDVI conforme a nova ordem dos DOYs
+            ndvi_mean_plot = ndvi_mean[sorted_indices]
+            ndvi_smooth_plot = ndvi_smooth[sorted_indices]
+
+            # plt.figure(figsize=(8, 4))
+            # plt.plot(doy_adjusted, ndvi_mean_plot, label="NDVI Original", marker="o", linestyle="--", color="blue")
+            # plt.xlabel("DOY")
+            # plt.ylabel("NDVI")
+            # plt.title(f"NDVI Original - Sample {id}")
+            # plt.legend()
+            # plt.savefig(f"{root_path}/ndvi_original.png")
+            # plt.close()
+
+            # # Plot NDVI suavizado
+            # plt.figure(figsize=(8, 4))
+            # plt.plot(doy_adjusted, ndvi_smooth_plot, label="NDVI Suavizado", marker="o", linestyle="--", color="green")
+            # plt.xlabel("DOY")
+            # plt.ylabel("NDVI")
+            # plt.title(f"NDVI Suavizado - Sample {id}")
+            # plt.legend()
+            # plt.savefig(f"{root_path}/ndvi_suavizado.png")
+            # plt.close()
+
+            # # Determinar os limites de corte (60 dias antes e depois do pico)
+            # if len(doy) > 0:
+            #     peak_doy = doy[peak_idx]
+            #     start_doy = peak_doy - 60
+            #     end_doy = peak_doy + 60
+
+            #     # Filtrar série temporal para manter apenas o intervalo desejado
+            #     mask = (doy >= start_doy) & (doy <= end_doy)
+                
+            #     ts_origin = ts_origin[mask]
+            #     # ts_origin = ts_origin[:peak_idx + 1]
+            #     doy = doy[mask]
+            #     # doy = doy[:peak_idx + 1]
+            #     ndvi_mean = ndvi_mean[mask]
+            #     # ndvi_mean = ndvi_mean[:peak_idx + 1]
+            #     ndvi_smooth_list = np.array(ndvi_smooth_list)[mask].tolist()
+            #     # ndvi_smooth_list = ndvi_smooth_list[:peak_idx + 1]
+            
+            # Normalização
+            if norm is not None:
+                m, s = norm
+                m = np.expand_dims(m, axis=-1)
+                s = np.expand_dims(s, axis=-1)
+                shape = ts_origin.shape
+                ts_origin = ts_origin.reshape((shape[0], shape[1], -1))
+                ts_origin = (ts_origin - m) / s
+                ts_origin = ts_origin.reshape(shape)
+            else:
+                ts_origin = ts_origin / 10000.0
+
+            ts_origin = ts_origin.astype(np.float32)
+            if augment:
+                ts_origin = transform(ts_origin)
+
+            # Tamanho da série temporal após corte
+            ts_length = ts_origin.shape[0]
+
+            # Padding da série temporal para o comprimento máximo
+            ts_origin = np.pad(
+                ts_origin,
+                ((0, max_length - ts_length), (0, 0), (0, 0), (0, 0)),
+                mode="constant",
+                constant_values=0.0
+            )
+
+            ndvi_list = np.pad(
+                ndvi_smooth_list,
+                (0, max_length - ts_length),
+                mode="constant",
+                constant_values=0,
+            )
+
+            # Padding do DOY
+            doy = np.pad(
+                doy,
+                (0, max_length - ts_length),
+                mode="constant",
+                constant_values=0
+            )
+
+            # Padding do NDVI
+            ndvi_mean = np.pad(
+                ndvi_mean,
+                (0, max_length - ts_length),
+                mode="constant",
+                constant_values=0
+            )
+
+            # Máscara de observação válida
+            bert_mask = np.zeros((max_length,), dtype=np.int16)
+            bert_mask[:ts_length] = 1
+
+            return (
+                ts_origin,
+                bert_mask,
+                doy,
+                class_label,
+                area_ha,
+                ndvi_list,
+            )
+    except Exception as e:
+        print(e)
+        print(id)
 
 
 class FinetuneDataset(Dataset):
     def __init__(
-        self, file_path, num_features, patch_size, max_length, norm=None, only_column=""
+        self,
+        file_path,
+        num_features,
+        patch_size,
+        max_length,
+        norm=None,
+        is_train=False,
+        only_column=""
     ):
         """
         :param file_path: path to the folder of the pre-training dataset
@@ -78,36 +199,51 @@ class FinetuneDataset(Dataset):
         self.max_length = max_length
         self.dimension = num_features
         self.patch_size = patch_size
+        self.is_train = is_train
 
         if only_column:  # Train, validate or test
-            gdf = gpd.read_parquet(file_path)
+            gdf: gpd.GeoDataFrame = gpd.read_parquet(file_path)
             gdf = gdf[gdf[only_column]].reset_index(drop=True)
-            self.FileList = gdf.former_download_filepath.to_list()
+            self.FileList = gdf.downloaded_filepath.to_list()
         else:  # Predicting
+            gdf: gpd.GeoDataFrame = gpd.read_parquet(file_path)
             self.FileList = gpd.read_parquet(
                 file_path
-            ).former_download_filepath.to_list()
+            ).downloaded_filepath.to_list()
+
+        if only_column:
+            self.productivity = gdf["prod"].to_numpy()
+            self.area_ha = gdf["area_ha"].to_numpy()
+        else:
+            self.productivity = None
+
+        self.productivity = gdf["prod"].to_numpy()
+        self.area_ha = gdf["area_ha"].to_numpy()
+        self.id = gdf["id"].to_numpy()
 
         self.TS_num = len(self.FileList)  # number of labeled samples
         self.norm = norm
-
         self.ts_origins = np.zeros(
             (self.TS_num, max_length, num_features, patch_size, patch_size),
             dtype=np.float32,
         )
         self.bert_masks = np.zeros((self.TS_num, max_length), dtype=np.int16)
         self.timestamps = np.zeros((self.TS_num, max_length), dtype=np.int16)
-        self.class_labels = np.zeros((self.TS_num, 1), dtype=np.int16)
+        self.class_labels = np.zeros((self.TS_num, 1), dtype=np.float32)
+        self.areas_ha = np.zeros((self.TS_num, 1), dtype=np.float32)
+        self.ndvi_timestamps = np.zeros((self.TS_num, max_length), dtype=np.float32)
+        self.ndwi_timestamps = np.zeros((self.TS_num, max_length), dtype=np.float32)
+
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = []
             for n, sample_path in enumerate(self.FileList):
                 futures.append(
                     executor.submit(
-                        lambda x_sample_path, x_max_length, x_norm, x_augment, x_n: [
+                        lambda x_sample_path, x_max_length, x_norm, x_augment, x_n, x_prod, area_ha, id: [
                             x_n,
                             prepare_sample(
-                                x_sample_path, x_max_length, x_norm, x_augment
+                                x_sample_path, x_max_length, x_norm, x_augment, x_prod[x_n], area_ha[x_n], id[x_n]
                             ),
                         ],
                         f"../{sample_path}",
@@ -115,6 +251,9 @@ class FinetuneDataset(Dataset):
                         self.norm,
                         only_column == "train",
                         n,
+                        self.productivity,
+                        self.area_ha,
+                        self.id
                     )
                 )
 
@@ -124,11 +263,19 @@ class FinetuneDataset(Dataset):
                 miniters=100,
                 desc=f"Building{' ' + only_column} dataset...",
             ):
-                n, (ts_origin, bert_mask, doy, class_label) = future.result()
+                n, (ts_origin, bert_mask, doy, class_label, area_ha, ndvi) = future.result()
                 self.ts_origins[n] = ts_origin
                 self.bert_masks[n] = bert_mask
                 self.timestamps[n] = doy
                 self.class_labels[n] = class_label
+                # n, (ts_origin, bert_mask, doy, class_label, area_ha, ndvi, ndwi) = future.result()
+                # self.ts_origins[n] = ts_origin
+                # self.bert_masks[n] = bert_mask
+                # self.timestamps[n] = doy
+                # self.class_labels[n] = class_label
+                self.areas_ha[n] = np.float32(area_ha)
+                self.ndvi_timestamps[n] = ndvi
+                # self.ndwi_timestamps[n] = ndwi
 
     def __len__(self):
         return self.TS_num
@@ -139,6 +286,9 @@ class FinetuneDataset(Dataset):
             "bert_mask": self.bert_masks[item],
             "timestamp": self.timestamps[item],
             "class_label": self.class_labels[item],
+            "area_ha": self.areas_ha[item],
+            "ndvi": self.ndvi_timestamps[item]
         }
 
-        return {key: torch.from_numpy(value) for key, value in output.items()}
+        torch_tensors = {key: torch.from_numpy(value).float() for key, value in output.items()}
+        return torch_tensors

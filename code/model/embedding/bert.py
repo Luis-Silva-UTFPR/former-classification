@@ -50,6 +50,19 @@ class BERTEmbedding(nn.Module):
             nn.BatchNorm3d(channel_size[1]),
         )
 
+        # PARA 10X10
+        self.conv3 = nn.Sequential(
+            nn.Conv3d(
+                in_channels=64,  # Mantém os canais
+                out_channels=64,  # Não altera profundidade
+                kernel_size=(3, 3, 3),  # Tamanho do kernel maior para reduzir mais rápido
+                stride=(1, 6, 6),  # Stride maior para reduzir diretamente para (1,1)
+                padding=(1, 1, 1)  # Mantém o tamanho certo sem cortar informação
+            ),
+            nn.ReLU(),
+            nn.BatchNorm3d(64),
+        )
+
         self.linear = nn.Linear(
             in_features=channel_size[1]*2,
             out_features=channel_size[2]
@@ -77,6 +90,8 @@ class BERTEmbedding(nn.Module):
         ).unsqueeze(1)
         obs_embed = self.conv1(obs_embed)
         obs_embed = self.conv2(obs_embed)
+        obs_embed = self.conv3(obs_embed)
+
         obs_embed = self.linear(obs_embed.view(first_dim, -1))
         # [batch_size*seq_length, embed_size]
         obs_embed = obs_embed.view(batch_size, seq_length, -1)

@@ -1,0 +1,17 @@
+/regression/*
+/finetuning/*
+/code/regression/*
+data/
+final_regression/
+finetuning/
+plots_*/
+regression/
+teste_regression/
+/data/
+
+*.parquet
+*.csv
+*.pyc
+__pycache__/
+*__pycache__/
+*.pco
